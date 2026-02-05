@@ -1,6 +1,6 @@
-# xgeo_kgrag — Geo-Scale Sweep Final Artifacts (A800 80GB)
+# Geo-Scale Sweep Final Artifacts (A800 80GB)
 
-### Project overview (XGeo-KGRAG / GeoScale Sweep)
+### Project overview (GeoScale Sweep)
 
 This project studies **how strongly “geometry” should influence entity ranking in KG benchmarks**. In many KG pipelines (including KG-augmented retrieval and embedding-based ranking), geometric structure is helpful—but only if it’s **calibrated**. Too little geometry reduces the model to a near-standard embedding scorer; too much geometry can distort neighborhoods and hurt ranking stability.
 
