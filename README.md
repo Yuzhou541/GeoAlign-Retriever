@@ -237,4 +237,3 @@ In this pipeline we avoid `group-by` and use explicit “seen/dedup” logic for
 - [x] `q2e_geoscale_sweep_mean_std.recalc.csv` generated
 - [x] `q2e_geoscale_best_by_mrr.csv` has **exactly one row** per `(kg,model,dim)` (12 groups)
 - [x] final tables + plots generated (`*_pivot_*`, `delta_vs_gs0`, PDFs)
-- [x] artifacts copied back locally → start writing paper
