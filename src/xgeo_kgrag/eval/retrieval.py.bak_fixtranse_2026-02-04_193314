@@ -1,0 +1,384 @@
+from __future__ import annotations
+from pathlib import Path
+import re
+from typing import Dict, Any, List, Tuple
+import time
+import warnings
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+
+from xgeo_kgrag.data.kg_dataset import KGData
+from xgeo_kgrag.data.text_data import load_queries
+from xgeo_kgrag.models.text_encoder import TextEncoder, TextEncoderCfg
+from xgeo_kgrag.models.projector import MLPProjector
+from xgeo_kgrag.models.kge_transe import TransE
+from xgeo_kgrag.models.kge_poincare import PoincareKGE
+from xgeo_kgrag.eval.distortion import neighborhood_consistency, distance_correlation
+from xgeo_kgrag.utils.device import get_device, get_dtype
+
+
+def _torch_load_quiet(path: str):
+    # 仅消掉 torch.load 的 FutureWarning（不改变行为）
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=FutureWarning,
+            message=r"You are using `torch\.load` with `weights_only=False`.*",
+        )
+        return torch.load(path, map_location="cpu")
+
+
+def _load_kge(kge_ckpt: str, data: KGData, dtype: torch.dtype, device: torch.device):
+    ckpt = _torch_load_quiet(kge_ckpt)
+    kge_cfg = ckpt.get("cfg", {})
+    model_name = (kge_cfg.get("kge", {}).get("model", "poincare")).lower()
+    dim = int(kge_cfg.get("kge", {}).get("dim", 64))
+
+    if model_name == "transe":
+        model = TransE(data.num_entities, data.num_relations, dim=dim)
+        model = model.to(device=device, dtype=dtype)
+    else:
+        curvature = float(kge_cfg.get("kge", {}).get("curvature", 1.0))
+        model = PoincareKGE(
+            data.num_entities,
+            data.num_relations,
+            dim=dim,
+            curvature=curvature,
+            dtype=dtype,
+        )
+        model = model.to(device=device)
+
+    model.load_state_dict(ckpt["model"], strict=True)
+    model.eval()
+    return model, model_name, dim
+
+
+def _load_projector(align_ckpt: str, device: torch.device, dtype: torch.dtype):
+    ckpt = _torch_load_quiet(align_ckpt)
+    cfg = ckpt.get("cfg", {})
+    proj_cfg = cfg.get("projector", None)
+    if proj_cfg is None:
+        raise RuntimeError("align checkpoint missing projector cfg")
+    proj = MLPProjector(**proj_cfg).to(device=device, dtype=dtype)
+    proj.load_state_dict(ckpt["projector"], strict=True)
+    proj.eval()
+    return proj
+
+
+def _recall_mrr(ranks: List[int], topk: List[int], num_candidates: int) -> Dict[str, float]:
+    # ranks: 1..num_candidates, miss -> num_candidates+1
+    ranks_np = np.asarray(ranks, dtype=np.float32)
+    out = {"mrr": float(np.mean(1.0 / ranks_np))}
+    for k in topk:
+        keff = int(min(max(int(k), 1), num_candidates))
+        out[f"recall@{int(k)}"] = float(np.mean(ranks_np <= keff))
+    return out
+
+
+def _parse_topk(cfg: Dict[str, Any], num_candidates: int) -> Tuple[List[int], int]:
+    raw = cfg.get("eval", {}).get("topk", [1, 5, 10])
+    topk = []
+    for x in raw:
+        try:
+            topk.append(int(x))
+        except Exception:
+            continue
+    if len(topk) == 0:
+        topk = [1, 5, 10]
+    # 保留原始 k 值用于命名，但搜索/计算时 clamp
+    kmax = int(max(min(max(k, 1), num_candidates) for k in topk))
+    return topk, kmax
+
+
+@torch.no_grad()
+
+def _canon_key(x: str) -> str:
+    # canonicalize strings across datasets (yago3-10 / fb15k237 / wn18rr)
+    x = x.strip().lower()
+    x = re.sub(r"[^0-9a-z]+", " ", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
+
+
+def _parse_query(q: str, rel2id, ent2id):
+    parts = [p.strip() for p in q.split("[SEP]")]
+    if len(parts) != 2:
+        raise ValueError(f"Bad [SEP] split: {q}")
+    left, right = parts
+    lc = _canon_key(left)
+    rc = _canon_key(right)
+
+    # Q_tail: head [SEP] relation -> predict tail
+    if rc in rel2id and lc in ent2id:
+        return ("tail", ent2id[lc], rel2id[rc])
+
+    # Q_head: relation [SEP] tail -> predict head
+    if lc in rel2id and rc in ent2id:
+        return ("head", ent2id[rc], rel2id[lc])
+
+    raise ValueError(f"Unrecognized query pattern: {q}")
+
+
+def _poincare_query_tan(kge, qtype: str, known_eid: int, rid: int):
+    """
+    Return q_tan in tangent space at 0, shape (D,)
+    Uses proper Möbius translation & inverse.
+    """
+    ball = kge.ball
+    e_ball = kge.ent[known_eid]  # on ball
+    r_tan = kge.rel_tan.weight[rid].to(e_ball.dtype)
+    r_ball = ball.expmap0(r_tan)
+    if qtype == "tail":
+        q_ball = ball.mobius_add(e_ball, r_ball)
+    else:
+        r_inv = -r_ball
+        if hasattr(ball, 'projx'):
+            r_inv = ball.projx(r_inv)
+        q_ball = ball.mobius_add(e_ball, r_inv)
+    return ball.logmap0(q_ball)
+
+
+def _transe_query_vec(kge, qtype: str, known_eid: int, rid: int):
+    """TransE-style structural query vector in entity space."""
+    e = kge.ent[known_eid]
+    r = kge.rel.weight[rid] if hasattr(kge.rel, "weight") else kge.rel[rid]
+    return e + r if qtype == "tail" else e - r
+
+
+def eval_retrieval(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    device = get_device(cfg.get("device", "cuda"))
+    dtype = get_dtype(cfg.get("dtype", "float32"))
+
+    data = KGData(cfg["data"]["data_dir"])
+    queries = load_queries(str(Path(cfg["data"]["data_dir"]) / "queries.tsv"))
+    if len(queries) == 0:
+        raise RuntimeError("No queries.tsv found. Provide data/<kg>/queries.tsv")
+
+    te_cfg = TextEncoderCfg(**cfg["text_encoder"])
+    text_encoder = TextEncoder(te_cfg, device=device)
+
+    kge, kge_name, kge_dim = _load_kge(cfg["kge_ckpt"], data, dtype=dtype, device=device)
+    proj = _load_projector(cfg["align_ckpt"], device=device, dtype=dtype)
+
+    # --------- encode entities (structure -> euclidean -> projector) ----------
+    struct_all = kge.get_entity_representations_for_alignment().to(device=device, dtype=dtype)
+    ent_vecs = proj(struct_all)
+    ent_vecs = F.normalize(ent_vecs, dim=-1) if te_cfg.normalize else ent_vecs
+    num_ents = int(ent_vecs.size(0))
+
+    # --- IMPORTANT: map ent_vecs row -> global entity id (avoid order mismatch) ---
+    if hasattr(kge, "entity_ids_for_alignment"):
+        ent_ids = kge.entity_ids_for_alignment()
+        ent_ids = torch.as_tensor(ent_ids, device=ent_vecs.device, dtype=torch.long)
+    else:
+        ent_ids = torch.arange(num_ents, device=ent_vecs.device, dtype=torch.long)
+
+
+    # --------- encode queries ----------
+    q_texts = [q for q, _ in queries]
+    ans_ents = [a for _, a in queries]
+    ans_ids = [data.maps.ent2id[a] for a in ans_ents]
+
+    q_emb = text_encoder.encode(q_texts, batch_size=int(cfg["data"].get("batch_size", 128)))
+        # --------- OPTIONAL: apply trained q2e query encoder (qenc) ----------
+    q2e_ckpt = cfg.get("q2e_ckpt", None) or cfg.get("qenc_ckpt", None)
+    if q2e_ckpt:
+        ckpt_q2e = torch.load(q2e_ckpt, map_location="cpu")
+        sd = ckpt_q2e.get("qenc", None)
+        if sd is None:
+            raise RuntimeError(f"[qenc] missing key 'qenc' in {q2e_ckpt}")
+
+        w0 = sd["net.0.weight"]  # (hidden, in_dim)
+        w3 = sd["net.3.weight"]  # (out_dim, hidden)
+        hidden, in_dim = int(w0.shape[0]), int(w0.shape[1])
+        out_dim, hidden2 = int(w3.shape[0]), int(w3.shape[1])
+        if hidden != hidden2:
+            raise RuntimeError(f"[qenc] shape mismatch: net.0 {tuple(w0.shape)} vs net.3 {tuple(w3.shape)}")
+
+        # Rebuild the exact-index Sequential: net[0]=Linear, net[1]=act, net[2]=dropout, net[3]=Linear
+        qenc = nn.Module()
+        qenc.net = nn.Sequential(
+            nn.Linear(in_dim, hidden, bias=True),
+            nn.ReLU(),          # parameter-free; exact choice doesn't affect weights loading
+            nn.Dropout(p=0.0),  # dropout off in eval; keep slot so net.3 matches
+            nn.Linear(hidden, out_dim, bias=True),
+        )
+        qenc.net.load_state_dict(sd, strict=True)
+        qenc = qenc.to(device=device, dtype=dtype)
+        qenc.eval()
+
+        # If qenc expects extra dims (e.g., text+geo), pad zeros to run.
+        q_txt = q_emb
+        q_txt_dim = int(q_txt.shape[-1])
+        if in_dim == 2 * q_txt_dim:
+            # Eval-time: replicate training q_geo construction (no circular imports)
+            rel2id = data.maps.rel2id
+            ent2id = data.maps.ent2id
+            rel_norm2id = {_canon_key(k): v for k, v in rel2id.items()}
+            ent_norm2id = {_canon_key(k): v for k, v in ent2id.items()}
+            # Get query texts aligned with q_txt rows
+            _qtexts = None
+            for _name in ('q_texts','q_strs','q_strings','q_list','queries_texts','q_raws','q_raw'):
+                v = locals().get(_name, None)
+                if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], str)):
+                    _qtexts = v
+                    break
+            if _qtexts is None and 'queries' in locals():
+                v = locals()['queries']
+                if isinstance(v, list) and len(v) and isinstance(v[0], (tuple, list)) and len(v[0]) and isinstance(v[0][0], str):
+                    _qtexts = [x[0] for x in v]
+            if _qtexts is None:
+                raise RuntimeError('Cannot find query texts to build q_geo; expose q_texts or queries list in eval_retrieval.')
+            q_geo_list = []
+            miss = 0
+            for q_str in _qtexts:
+                try:
+                    qtype, known_eid, rid = _parse_query(q_str, rel_norm2id, ent_norm2id)
+                except Exception:
+                    miss += 1
+                    q_geo_list.append(torch.zeros(1, q_txt_dim, device=q_txt.device, dtype=q_txt.dtype))
+                    continue
+                if hasattr(kge, 'ball'):
+                    q_tan = _poincare_query_tan(kge, qtype, known_eid, rid)
+                    q_struct = q_tan.unsqueeze(0)
+                else:
+                    q_struct = _transe_query_vec(kge, qtype, known_eid, rid).unsqueeze(0)
+                q_struct = q_struct.to(device=q_txt.device, dtype=q_txt.dtype)
+                with torch.no_grad():
+                    q_geo = proj(q_struct)
+                    q_geo = F.normalize(q_geo, dim=-1)
+                q_geo_list.append(q_geo)
+            if miss:
+                print(f'[WARN] q_geo parse miss={miss}/{len(_qtexts)} -> zeros')
+            q_geo = torch.cat(q_geo_list, dim=0)
+            q_in = torch.cat([q_txt, q_geo], dim=-1)
+        else:
+            if in_dim != q_txt_dim:
+                if in_dim > q_txt_dim:
+                    pad = torch.zeros(q_txt.size(0), in_dim - q_txt_dim, device=q_txt.device, dtype=q_txt.dtype)
+                    q_in = torch.cat([q_txt, pad], dim=-1)
+                    print(f"[WARN] qenc expects in_dim={in_dim}, but q_txt_dim={q_txt_dim}. "
+                          f"Zero-padding {in_dim-q_txt_dim} dims. If training used non-zero q_geo, "
+                          f"replicate its construction here.")
+                else:
+                    q_in = q_txt[:, :in_dim]
+                    print(f"[WARN] qenc expects in_dim={in_dim} < q_txt_dim={q_txt_dim}. Truncating.")
+            else:
+                q_in = q_txt
+        q_emb = qenc.net(q_in)
+
+        # sanity: q_emb must match entity vector dim for dot-product retrieval
+        if q_emb.shape[-1] != ent_vecs.shape[-1]:
+            raise RuntimeError(f"[qenc] output dim {q_emb.shape[-1]} != ent_vecs dim {ent_vecs.shape[-1]}")
+
+    q_emb = F.normalize(q_emb, dim=-1) if te_cfg.normalize else q_emb
+    # --- SANITY: query->answer cosine vs random negative (ent_ids-aware) ---
+    ans = torch.as_tensor(ans_ids, device=q_emb.device, dtype=torch.long)
+    is_identity = bool((ent_ids == torch.arange(num_ents, device=ent_ids.device)).all().item())
+    sorted_ids, sort_idx = torch.sort(ent_ids)
+    pos_in_sorted = torch.searchsorted(sorted_ids, ans)
+    ok = (pos_in_sorted < sorted_ids.numel()) & (sorted_ids[pos_in_sorted] == ans)
+    miss = int((~ok).sum().item())
+    ans_row = sort_idx[pos_in_sorted.clamp(max=sorted_ids.numel()-1)]
+    ans_row = torch.where(ok, ans_row, torch.zeros_like(ans_row))
+    pos = (q_emb * ent_vecs.index_select(0, ans_row)).sum(-1)
+    neg_row = torch.randint(0, num_ents, (ans.numel(),), device=q_emb.device)
+    neg = (q_emb * ent_vecs.index_select(0, neg_row)).sum(-1)
+    print(f"[SANITY] ent_ids_identity={is_identity} miss_ans={miss}/{ans.numel()} pos_mean={pos.mean().item():.4f} pos_std={pos.std().item():.4f} neg_mean={neg.mean().item():.4f} neg_std={neg.std().item():.4f}")
+    n = int(min(256, q_emb.size(0)))
+    s_sub = q_emb[:n] @ ent_vecs.t()
+    pred_row = s_sub.argmax(dim=1)
+    pred_ent = ent_ids.index_select(0, pred_row)
+    hit1 = (pred_ent == ans[:n]).float().mean().item()
+    print(f"[SANITY] subset_hit@1({n}) = {hit1:.4f}")
+
+    topk, Kmax = _parse_topk(cfg, num_candidates=num_ents)
+
+    # --------- bruteforce ----------
+    t0 = time.perf_counter()
+    sims = q_emb @ ent_vecs.t()
+    _, idx = torch.topk(sims, k=Kmax, dim=-1, largest=True)
+    t1 = time.perf_counter()
+
+    ranks = []
+    for qi in range(len(queries)):
+        target = ans_ids[qi]
+        retrieved = ent_ids.index_select(0, idx[qi]).tolist()
+        ranks.append(retrieved.index(target) + 1 if target in retrieved else num_ents + 1)
+
+    brute_metrics = _recall_mrr(ranks, topk, num_candidates=num_ents)
+    brute_metrics["bruteforce_ms"] = (t1 - t0) * 1000.0
+
+    # --------- faiss ----------
+    faiss_metrics = {}
+    if bool(cfg.get("eval", {}).get("faiss", True)):
+        import faiss
+
+        ent_np = ent_vecs.detach().cpu().numpy().astype("float32")
+        q_np = q_emb.detach().cpu().numpy().astype("float32")
+
+        index = faiss.IndexFlatIP(ent_np.shape[1])
+        tb0 = time.perf_counter()
+        index.add(ent_np)
+        tb1 = time.perf_counter()
+
+        tq0 = time.perf_counter()
+        _, I = index.search(q_np, Kmax)
+        tq1 = time.perf_counter()
+
+        ranks2 = []
+        for qi in range(len(queries)):
+            target = ans_ids[qi]
+            retrieved = ent_ids.index_select(0, torch.as_tensor(I[qi], device=ent_ids.device)).tolist()
+            ranks2.append(retrieved.index(target) + 1 if target in retrieved else num_ents + 1)
+
+        faiss_metrics = _recall_mrr(ranks2, topk, num_candidates=num_ents)
+        faiss_metrics["faiss_build_ms"] = (tb1 - tb0) * 1000.0
+        faiss_metrics["faiss_query_ms"] = (tq1 - tq0) * 1000.0
+
+    # --------- distortion (subsampled; scalable) ----------
+    distortion = {}
+    if bool(cfg.get("eval", {}).get("distortion", True)):
+        # 只在子集上算 O(n^2)，避免大图炸
+        n_sub = int(cfg.get("eval", {}).get("distortion_num_entities", 2000))
+        n_sub = max(50, min(n_sub, num_ents))
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(cfg.get("seed", 42)))
+        perm = torch.randperm(num_ents, generator=g)[:n_sub]
+        perm = perm.to(device=device)
+
+        ent_sub = ent_vecs.index_select(0, perm)
+        de = torch.cdist(ent_sub, ent_sub)
+
+        if kge_name == "poincare":
+            ball = kge.ball
+            ent_m = kge.ent.index_select(0, perm)
+            dm = ball.dist(ent_m.unsqueeze(1), ent_m.unsqueeze(0))
+        else:
+            em = kge.get_entity_representations_for_alignment().to(device=device, dtype=dtype)
+            em_sub = em.index_select(0, perm)
+            dm = torch.cdist(em_sub, em_sub)
+
+        k = int(cfg.get("eval", {}).get("distortion_k", 10))
+        k = max(2, min(k, n_sub - 1))
+        num_pair_samples = int(cfg.get("eval", {}).get("num_pair_samples", 2000))
+
+        distortion = {
+            "distortion_num_entities": int(n_sub),
+            "neighborhood_consistency": neighborhood_consistency(dm, de, k=k),
+            "distance_rank_corr": distance_correlation(dm, de, num_samples=num_pair_samples),
+        }
+
+    return {
+        "kge_model": kge_name,
+        "kge_dim": int(kge_dim),
+        "num_entities": int(data.num_entities),
+        "num_relations": int(data.num_relations),
+        "bruteforce": brute_metrics,
+        "faiss": faiss_metrics,
+        "distortion": distortion,
+    }
