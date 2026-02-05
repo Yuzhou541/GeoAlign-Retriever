@@ -1,0 +1,15 @@
+pyyaml>=6.0
+tqdm>=4.66
+numpy>=1.26
+pandas>=2.2
+
+geoopt>=0.5.1
+
+faiss-cpu>=1.8.0
+
+sentence-transformers>=3.0.0
+transformers>=4.45.0
+accelerate>=0.33.0
+
+rich>=13.7
+scikit-learn>=1.5
