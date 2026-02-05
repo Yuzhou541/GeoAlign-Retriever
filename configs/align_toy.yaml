@@ -1,0 +1,32 @@
+seed: 42
+device: cuda
+dtype: float32
+
+data:
+  data_dir: data/toykg
+  batch_size: 256
+  num_workers: 2
+
+kge_ckpt: runs/toy_poincare_kge/checkpoints/best.pt
+
+text_encoder:
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  max_length: 64
+  normalize: true
+
+projector:
+  in_dim: 64
+  out_dim: 384
+  hidden_dim: 512
+  num_layers: 2
+  dropout: 0.1
+
+train:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 10
+  temperature: 0.07
+  log_every: 50
+
+run:
+  out_dir: runs/toy_align
