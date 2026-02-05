@@ -1,0 +1,10 @@
+cat	is_a	animal
+dog	is_a	animal
+kitten	is_a	cat
+puppy	is_a	dog
+animal	part_of	nature
+cat	likes	milk
+dog	likes	bone
+kitten	likes	milk
+puppy	likes	bone
+milk	is_a	drink

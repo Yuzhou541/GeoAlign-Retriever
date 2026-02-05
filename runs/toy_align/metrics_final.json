@@ -1,0 +1,7 @@
+{
+  "best_infoNCE": 2.397895574569702,
+  "aligned_entities": 11,
+  "kge_model": "poincare",
+  "kge_dim": 64,
+  "out_dir": "runs\\toy_align"
+}

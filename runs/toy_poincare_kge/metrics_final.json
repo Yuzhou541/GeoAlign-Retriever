@@ -1,0 +1,8 @@
+{
+  "best_valid_mrr_tail": 0.11688312143087387,
+  "num_entities": 11,
+  "num_relations": 3,
+  "kge_model": "poincare",
+  "dim": 64,
+  "out_dir": "runs\\toy_poincare_kge"
+}

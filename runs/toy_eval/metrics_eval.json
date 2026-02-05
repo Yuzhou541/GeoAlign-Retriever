@@ -1,0 +1,37 @@
+{
+  "kge_model": "poincare",
+  "kge_dim": 64,
+  "num_entities": 11,
+  "num_relations": 3,
+  "effective_topk": [
+    1,
+    3,
+    5,
+    10
+  ],
+  "bruteforce": {
+    "mrr": 0.36722224950790405,
+    "recall@1": 0.2,
+    "recall@3": 0.4,
+    "recall@5": 0.4,
+    "recall@10": 1.0,
+    "bruteforce_ms": 19.56899999640882,
+    "bruteforce_query_chunk": 1024
+  },
+  "faiss": {
+    "mrr": 0.4452381134033203,
+    "recall@1": 0.2,
+    "recall@3": 0.6,
+    "recall@5": 0.8,
+    "recall@10": 1.0,
+    "faiss_build_ms": 0.03139999898849055,
+    "faiss_query_ms": 1.5942999962135218,
+    "faiss_index": "IndexFlatIP"
+  },
+  "distortion": {
+    "neighborhood_consistency": 0.834710743801653,
+    "distance_rank_corr": 0.024291139572700737,
+    "distortion_k": 10,
+    "num_pair_samples": 2000
+  }
+}

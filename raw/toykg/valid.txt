@@ -1,0 +1,2 @@
+bone	is_a	food
+drink	is_a	thing

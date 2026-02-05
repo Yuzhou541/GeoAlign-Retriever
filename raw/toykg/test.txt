@@ -1,0 +1,2 @@
+food	is_a	thing
+nature	is_a	thing
